@@ -7,14 +7,27 @@ import os
 image_path = os.environ.get('IMAGE', 'palm_tree.png')  # Replace with your image path
 image = cv2.imread(image_path)
 
-# Resize image for easier processing
-scale_percent = 50  # Percent of original size
+# Resize image for easier processing (we'll adjust this based on average intensity)
+# Convert to grayscale
+gray_full = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+# Calculate the average intensity of the full image
+avg_intensity_full = np.mean(gray_full)
+
+# Determine scaling factor based on average intensity
+# For simplicity, we'll map intensity range [0, 255] to scaling factor [30%, 100%]
+scale_percent = int(30 + (avg_intensity_full / 255) * 70)  # Scale between 30% and 100%
+
+# Ensure scale_percent is within reasonable bounds
+scale_percent = max(30, min(scale_percent, 100))
+
+# Resize image based on calculated scale_percent
 width = int(image.shape[1] * scale_percent / 100)
 height = int(image.shape[0] * scale_percent / 100)
 dim = (width, height)
 resized = cv2.resize(image, dim, interpolation=cv2.INTER_AREA)
 
-# Convert to grayscale
+# Convert resized image to grayscale
 gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
 
 # Use Canny edge detection
@@ -24,14 +37,15 @@ edges = cv2.Canny(gray, 50, 150)
 contours, hierarchy = cv2.findContours(
     edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
+# Check if any contours are found
+if not contours:
+    print("No contours found in the image.")
+    exit()
+
 # Assume the largest contour is the trunk
 contour_areas = [cv2.contourArea(c) for c in contours]
-if contour_areas:
-    max_index = np.argmax(contour_areas)
-    trunk_contour = contours[max_index]
-else:
-    print("No contours found.")
-    exit()
+max_index = np.argmax(contour_areas)
+trunk_contour = contours[max_index]
 
 # Create a mask for the trunk
 mask = np.zeros_like(gray)
@@ -40,27 +54,46 @@ cv2.drawContours(mask, [trunk_contour], -1, 255, thickness=cv2.FILLED)
 # Extract the trunk area
 trunk = cv2.bitwise_and(gray, gray, mask=mask)
 
+# Calculate the average intensity of the trunk area
+avg_intensity_trunk = np.mean(trunk[trunk > 0])  # Consider only the trunk pixels
+
+# Determine sampling rates based on trunk average intensity
+# Map intensity [0, 255] to vertical step size [10, 2] (smaller step size means more samples)
+vertical_step = int(10 - (avg_intensity_trunk / 255) * 8)  # Steps between 10 and 2
+vertical_step = max(2, min(vertical_step, 10))
+
+# Similarly for horizontal sampling, if desired
+# For this example, we'll keep horizontal sampling as the full width
+
 # Analyze patterns in the trunk
-# We'll scan horizontally and sum pixel values to create a pattern
 height, width = trunk.shape
 pattern = []
 
-for y in range(0, height, 5):  # Sample every 5 pixels vertically
+for y in range(0, height, vertical_step):  # Sample every 'vertical_step' pixels vertically
     row = trunk[y, :]
-    avg_intensity = np.mean(row)
-    pattern.append(avg_intensity)
+    avg_row_intensity = np.mean(row[row > 0])  # Consider only non-zero pixels
+    if np.isnan(avg_row_intensity):
+        avg_row_intensity = 0
+    pattern.append(avg_row_intensity)
 
 # Constrain the pitch range to a specific octave (e.g., C3 to C5)
 min_note = 48  # C3
 max_note = 72  # C5
 
 # Normalize the pattern to MIDI note numbers within the desired range
-min_intensity = min(pattern)
-max_intensity = max(pattern)
-normalized_pattern = [
-    int(min_note + (p - min_intensity) / (max_intensity - min_intensity) * (max_note - min_note))
-    for p in pattern
-]
+if pattern:
+    min_intensity = min(pattern)
+    max_intensity = max(pattern)
+    if max_intensity - min_intensity == 0:
+        normalized_pattern = [int((min_note + max_note) / 2)] * len(pattern)
+    else:
+        normalized_pattern = [
+            int(min_note + (p - min_intensity) / (max_intensity - min_intensity) * (max_note - min_note))
+            for p in pattern
+        ]
+else:
+    print("No pattern data extracted from the trunk.")
+    exit()
 
 # Adjust velocity mapping based on intensity contrast
 # Compute the difference between successive intensity values
@@ -94,11 +127,11 @@ sixteenth_note = ticks_per_beat // 4
 time = 0
 for i, note in enumerate(normalized_pattern):
     velocity = normalized_velocity[i]
-    
+
     # Add modulation based on average intensity
     # Map the average intensity to modulation wheel value (controller number 1)
-    modulation = int((pattern[i] - min_intensity) / (max_intensity - min_intensity) * 127)
-    
+    modulation = int((pattern[i] - min_intensity) / (max_intensity - min_intensity) * 127) if max_intensity - min_intensity != 0 else 0
+
     # Add Control Change message for modulation
     track.append(Message('control_change', control=1, value=modulation, time=time))
     time = 0  # Reset time for subsequent messages
